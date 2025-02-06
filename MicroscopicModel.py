@@ -3,8 +3,9 @@ import seaborn as sns
 from numba import njit
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
-from numba import int8, float64
+from numba import int8, int16, float64
 from numba.experimental import jitclass
+from tqdm import tqdm
 
 sns.set_theme(context='paper', style='ticks', font_scale=1.2)
 
@@ -12,7 +13,7 @@ sns.set_theme(context='paper', style='ticks', font_scale=1.2)
 #                           ANTS CLASS & HELPERS
 ##############################################################################
 spec = [
-    ('nv', int8),
+    ('nv', int16),
     ('f0', float64),
     ('f_ind', float64),
     ('nestDir', float64[:]),
@@ -86,10 +87,10 @@ class Ants:
         self.ants, self.angles = forgetAnt(self.ants, self.angles, self.nv)
 
     def reorientAnts(self, q, F):
-        reorientAnts(self.ants, self.angles, self.nestDir, F, self.nv)
+        reorientAnts(self.ants, self.angles, self.nestDir, self.nv, q, F)
 
-    def convertAnts(self, q, F):
-        self.ants, self.angles = convertAnts(q, F, self.ants, self.angles,
+    def convertAnt(self, q, F):
+        self.ants, self.angles = convertAnt(q, F, self.ants, self.angles,
                                              self.f_ind, self.Kconvert, self.nv)
 
 
@@ -175,11 +176,12 @@ def pConvert(q, F, ants, angles, f_ind, Kconvert, nv):
         Fi = F[i]
         for j in range(2):
             aij = ants[i,j]
+            if aij < 2:
+                continue
+            arg = (p[i,j,0]*Fi[0] + p[i,j,1]*Fi[1]) / f_ind
             if aij == 2:
-                arg = (p[i,j,0]*Fi[0] + p[i,j,1]*Fi[1]) / f_ind
                 Pr[i,j] = np.exp(-arg)
             elif aij == 3:
-                arg = (p[i,j,0]*Fi[0] + p[i,j,1]*Fi[1]) / f_ind
                 Pr[i,j] = np.exp(arg)
     return Kconvert * Pr
 
@@ -218,7 +220,7 @@ def forgetAnt(ants, angles, nv):
     if inf_idx.size == 0:
         return ants, angles
     site = np.random.choice(inf_idx)
-    if np.random.rand() < 0.5:
+    if np.random.rand() < 0.5: #TODO: check this
         a[site] = 2
     else:
         a[site] = 3
@@ -227,47 +229,41 @@ def forgetAnt(ants, angles, nv):
 
 # ----------------------------------------------------------------------
 @njit
-def reorientAnts(ants, angles, nestDir, F, nv,
-                 phiMax=np.deg2rad(52.0)):
+def reorientAnts(ants, angles, nestDir, nv, q, F, phiMax=52, damping=0.95):
+    phiMax = np.deg2rad(phiMax) # Convert to radians
+    antDirs = getAntDirections(q, ants, angles, nv)
     for i in range(nv):
-        Fi = F[i]
-        normF = np.sqrt(Fi[0] * Fi[0] + Fi[1] * Fi[1])
-
         for j in range(2):
-            aij = ants[i, j]
-            if aij == 3:
-                continue
-            if aij == 1:
-                angle_des = np.arctan2(nestDir[1], nestDir[0])
-            elif aij == 2:
-                angle_des = np.arctan2(Fi[1], Fi[0])
+            if ants[i, j] == 1:
+                refDir = nestDir - antDirs[i, j] # Shift to reference frame
+            elif ants[i, j] == 2:
+                refDir = F[i]
             else:
                 continue
+            phi0 = angles[i, j]  # Current angle
+            theta = np.arctan2(refDir[1], refDir[0])  # Desired angle
+            phi = phi0 + (theta - phi0)*(1-damping)  # Damped (weighted) angle
 
-            old_angle = angles[i, j]
-
-            new_angle = old_angle + (angle_des - old_angle)
-            if new_angle > phiMax:
-                new_angle = phiMax
-            elif new_angle < -phiMax:
-                new_angle = -phiMax
-
-            angles[i, j] = new_angle
+            if np.abs(phi) > phiMax:
+                phi = np.sign(phi) * phiMax
+            angles[i, j] = phi  # Update angle
+    return
 
 # ----------------------------------------------------------------------
 @njit
-def convertAnts(q, F, ants, angles, f_ind, Kconvert, nv):
+def convertAnt(q, F, ants, angles, f_ind, Kconvert, nv):
     P = pConvert(q, F, ants, angles, f_ind, Kconvert, nv).flatten()
+    # TODO: Convert the ant with the highest probability?
     a = ants.flatten()
     an = angles.flatten()
-    for idx in range(a.size):
-        if a[idx] == 2 or a[idx] == 3:
-            if np.random.rand() < P[idx]:
-                if a[idx] == 2:
-                    a[idx] = 3  # lifter
-                    an[idx] = 0.0
-                else:
-                    a[idx] = 2  # puller
+    idx = np.where(a >= 2)[0]
+    site = np.random.choice(idx)
+    if np.random.rand() < P[site]:
+        if a[site] == 2:
+            a[site] = 3 # lifter
+            an[site] = 0.0
+        else:
+            a[site] = 2 # puller
     return a.reshape(nv,2), an.reshape(nv,2)
 
 ##############################################################################
@@ -367,6 +363,12 @@ def getFb(q, dL, nv, EI):
 def solveStep(q, F, dL, nv, dt, gamma, EI, EA,
               antsObj,
               cTime, eventTime):
+    
+    # TODO: We can call either call mechanical forces here (or pass them as arguments)
+    #       to allow ants to reorient\convert based on the mechanical forces alone- sensing velocity.
+    #
+    #       Also, we can return the four forces acting on the rod (bending, stretching, informed, puller)
+    #       individually to allow for more detailed analysis.
 
     if cTime >= eventTime:
         Ron     = antsObj.getRon()
@@ -376,23 +378,24 @@ def solveStep(q, F, dL, nv, dt, gamma, EI, EA,
         Rconvert  = antsObj.getRconvert(q, F)
         Rtot = Ron + Roff + Rforget + Rreorient + Rconvert
 
-        if Rtot > 1e-16:
+        if Rtot > 1e-16: # TODO: why? zero division? shouldn't happen because Kon + Koff + Kforget > 0
             r1 = np.random.rand()
-            tau = -np.log(r1)/Rtot
+            tau = -np.log(r1)/Rtot # Exponential distributed; lambda = Rtot
             eventTime = cTime + tau
 
             r2 = np.random.rand()
-
+            # TODO: This is correct but can be rewritten in a more readable way (see original implementation)
             if r2 < Ron / Rtot:
                 antsObj.attachAnt()
             elif Ron / Rtot <= r2 < (Ron + Roff) / Rtot:
                 antsObj.detachAnt()
             elif (Ron + Roff) / Rtot <= r2 < (Ron + Roff + Rconvert) / Rtot:
-                antsObj.convertAnts(q, F)
+                antsObj.convertAnt(q, F)
             elif (Ron + Roff + Rconvert) / Rtot <= r2 < (Ron + Roff + Rconvert + Rreorient) / Rtot:
                 antsObj.reorientAnts(q, F)
             elif Rforget != 0:
                 antsObj.forgetAnt()
+
 
     Fb_ = getFb(q, dL, nv, EI)
     Fs_ = getFs(q, dL, nv, EA)
@@ -470,8 +473,11 @@ def run(totalTime, doPlot=False, saveData=True):
     Kon = 0.0215
     Koff = 0.015
     Kforget = 0.09
-    Kconvert = 1.0
+    Kconvert = 0.2
     Kreorient = 0.7
+
+    saveEvery = int(1/dt) / 10
+    plotEvery = int(1/dt) * 2
 
     antsObj = Ants(NV=NV, F0=F0, F_IND=F_IND, NEST_DIR=nestDir,
                    Kon=Kon, Koff=Koff, Kforget=Kforget,
@@ -493,8 +499,11 @@ def run(totalTime, doPlot=False, saveData=True):
     if doPlot:
         plt.figure(figsize=(6, 6))
 
+    # Create progress bar
+    pbar = tqdm(total=totalTime, desc="Running simulation", unit="Time")
+
     while cTime < totalTime:
-        if stepCount % 10000 == 0:
+        if stepCount % saveEvery == 0:
             time_list.append(cTime)
             q_list.append(q.copy())
             ants_list.append(antsObj.ants.copy())
@@ -506,12 +515,14 @@ def run(totalTime, doPlot=False, saveData=True):
         cTime += dt
         stepCount += 1
 
-        if doPlot and (stepCount % 10000 == 0):
-            print(f"time={cTime:.4f}")
+        pbar.update(cTime)
+
+        if doPlot and (stepCount % plotEvery == 0):
             plotrod(q, cTime, L)
             plotAnts(q, antsObj)
             plt.pause(0.01)
 
+    # Save final state
     time_list.append(cTime)
     q_list.append(q.copy())
     ants_list.append(antsObj.ants.copy())
@@ -523,7 +534,7 @@ def run(totalTime, doPlot=False, saveData=True):
         ants_array = np.array(ants_list)
         angles_array = np.array(angles_list)
 
-        np.savez("soft_pendulum_microscopic.npz",
+        np.savez("soft_pendulum_microscopic.npz", # TODO: Filename based on parameters
                  time=time_array,
                  q=q_array,
                  ants=ants_array,

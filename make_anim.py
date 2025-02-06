@@ -4,6 +4,7 @@ from matplotlib.animation import FuncAnimation, PillowWriter, FFMpegWriter
 from MicroscopicModel import plotrod, plotAnts
 import subprocess
 from tqdm import tqdm
+import multiprocessing as mp
 
 def animate_from_npz_funcAnimation(npz_file="soft_pendulum_microscopic.npz",
                                    out_file="rod_ants",
@@ -75,8 +76,15 @@ def animate_from_npz_funcAnimation(npz_file="soft_pendulum_microscopic.npz",
     pbar.close()
     print(f"Animation saved as {outfile}")
 
+
+def run_animation():
+        animate_from_npz_funcAnimation(npz_file="soft_pendulum_microscopic.npz",
+                                       out_file="rod_ants",
+                                       rod_length=15.0,
+                                       output_format="mp4")
+        
 if __name__ == "__main__":
-    animate_from_npz_funcAnimation(npz_file="soft_pendulum_microscopic.npz",
-                                   out_file="rod_ants",
-                                   rod_length=15.0,
-                                   output_format="mp4")
+
+    p = mp.Process(target=run_animation)
+    p.start()
+    p.join()
