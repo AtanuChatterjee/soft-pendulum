@@ -1,17 +1,39 @@
+import json
+import matplotlib
 import numpy as np
+import os, datetime
+from time import time
+from tqdm import tqdm
 import seaborn as sns
-from numba import njit
+from numba import njit, prange
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 from numba import int8, int16, float64
 from numba.experimental import jitclass
-from tqdm import tqdm
 
+np.random.seed(42)
+
+matplotlib.use("TkAgg")
 sns.set_theme(context='paper', style='ticks', font_scale=1.2)
 
-##############################################################################
-#                           ANTS CLASS & HELPERS
-##############################################################################
+SEG_LEN_CM = 1.0
+BASE_SEG_LEN_CM = 1.0
+
+EA_BASE = 1e4
+EI_BASE = 1e4
+GAMMA_BASE = 10
+
+
+@njit(float64(float64))
+def safe_sigmoid(x):
+    if x >= 0:
+        z = np.exp(-x)
+        return 1.0 / (1.0 + z)
+    else:
+        z = np.exp(x)
+        return z / (1.0 + z)
+
+
 spec = [
     ('nv', int16),
     ('f0', float64),
@@ -24,7 +46,10 @@ spec = [
     ('Kreorient', float64),
     ('ants', int8[:, :]),
     ('angles', float64[:, :]),
+    ('phiDamping', float64),
+    ('phiMax', float64),
 ]
+
 
 @jitclass(spec)
 class Ants:
@@ -33,24 +58,30 @@ class Ants:
     ants[i, j] = 1 => informed
     ants[i, j] = 2 => puller
     ants[i, j] = 3 => lifter
-
-    angles[i, j] stores the (radian) angle offset from local normal
     """
 
     def __init__(self, NV, F0, F_IND, NEST_DIR,
-                 Kon, Koff, Kforget, Kconvert, Kreorient):
-        self.nv       = NV
-        self.f0       = F0
-        self.f_ind    = F_IND
-        self.nestDir  = NEST_DIR
-        self.Kon      = Kon
-        self.Koff     = Koff
-        self.Kforget  = Kforget
+                 Kon, Koff, Kforget, Kconvert, Kreorient,
+                 phiDamping, phiMax):
+        self.nv = NV
+        self.f0 = F0
+        self.f_ind = F_IND
+        self.nestDir = NEST_DIR
+        self.Kon = Kon
+        self.Koff = Koff
+        self.Kforget = Kforget
         self.Kconvert = Kconvert
-        self.Kreorient= Kreorient
+        self.Kreorient = Kreorient
+        self.phiDamping = phiDamping
+        self.phiMax = phiMax
 
-        self.ants     = np.zeros((NV, 2), dtype=np.int8)
-        self.angles   = np.zeros((NV, 2))
+        self.ants = np.zeros((NV, 2), dtype=np.int8)
+        self.angles = np.zeros((NV, 2))
+
+        # Initial conditions 
+        self.ants[:, :] = 0 # no ants
+        self.angles[:, :] = 0
+
 
     # ------------------------------------------------------------------------
     def getInformedForce(self, q):
@@ -73,8 +104,8 @@ class Ants:
         return self.Kreorient * np.sum((self.ants == 1) | (self.ants == 2))
 
     def getRconvert(self, q, F):
-        P = pConvert(q, F, self.ants, self.angles, self.f_ind, self.Kconvert, self.nv)
-        return np.sum(P)
+        P = pConvert(q, F, self.ants, self.angles, self.f_ind, self.nv)
+        return self.Kconvert * np.sum(P)
 
     # ------------------------------------------------------------------------
     def attachAnt(self):
@@ -83,41 +114,40 @@ class Ants:
     def detachAnt(self):
         self.ants, self.angles = detachAnt(self.ants, self.angles, self.nv)
 
-    def forgetAnt(self):
-        self.ants, self.angles = forgetAnt(self.ants, self.angles, self.nv)
+    def forgetAnt(self, q, F):
+        self.ants, self.angles = forgetAnt(q, F, self.ants, self.angles,
+                                           self.f_ind, self.nv, nestDir=self.nestDir,
+                                           phiDamping=self.phiDamping, phiMax_deg=self.phiMax)
 
     def reorientAnts(self, q, F):
-        reorientAnts(self.ants, self.angles, self.nestDir, self.nv, q, F)
+        reorientAnts(self.ants, self.angles, self.nestDir, self.nv,
+                     q, F, self.phiDamping, self.phiMax)
 
     def convertAnt(self, q, F):
         self.ants, self.angles = convertAnt(q, F, self.ants, self.angles,
-                                             self.f_ind, self.Kconvert, self.nv)
+                                            self.f_ind, self.nv)
 
 
-###############################################################################
-#                   HELPER FUNCTIONS (ANTS)
-###############################################################################
 @njit
 def getEdges(q):
     nv = q.size // 2
-    edges = np.zeros((nv, 2))
     xy = q.reshape(nv, 2)
-    for i in range(1, nv):
-        dx = xy[i, 0] - xy[i - 1, 0]
-        dy = xy[i, 1] - xy[i - 1, 1]
-        norm_ = np.sqrt(dx * dx + dy * dy) + 1e-16
-        edges[i, 0] = dx / norm_
-        edges[i, 1] = dy / norm_
+    edges = np.empty((nv - 1, 2))
+    for i in range(nv - 1):
+        dx = xy[i + 1, 0] - xy[i, 0]
+        dy = xy[i + 1, 1] - xy[i, 1]
+        n = 1.0 / (np.sqrt(dx * dx + dy * dy) + 1e-16)
+        edges[i, 0] = dx * n
+        edges[i, 1] = dy * n
     return edges
 
 
 @njit
 def getOrthogonalEdges(q):
     E = getEdges(q)
-    nv = E.shape[0]
-    O = np.zeros_like(E)
-    for i in range(nv):
-        tx, ty = E[i, 0], E[i, 1]
+    O = np.empty_like(E)
+    for i in range(E.shape[0]):
+        tx, ty = E[i]
         O[i, 0] = -ty
         O[i, 1] = tx
     return O
@@ -131,318 +161,330 @@ def rotate(v, theta):
                      s * v[0] + c * v[1]])
 
 
-@njit
+@njit(fastmath=True)
 def getAntDirections(q, ants, angles, nv):
-    antDirections = np.zeros((nv, 2, 2))
-    O = getOrthogonalEdges(q)
+    xy = q.reshape(nv, 2)
+    dirs = np.zeros((nv, 2, 2), dtype=q.dtype)
+
     for i in range(nv):
-        for j in range(2):
+        if np.all(ants[i] == 0):
+            continue
+        n = local_normal(xy, i, nv)
+        for j in (0, 1):
             if ants[i, j] == 0:
                 continue
-            if j == 0:
-                base_dir = O[i]
-            else:
-                base_dir = -O[i]
-            rotated = rotate(base_dir, angles[i, j])
-            antDirections[i, j] = rotated
-    return antDirections
+            base = n if j == 0 else -n
+            vec = rotate(base, angles[i, j])
+            inv = 1.0 / (np.sqrt(vec[0] ** 2 + vec[1] ** 2) + 1e-16)
+            dirs[i, j, 0] = vec[0] * inv
+            dirs[i, j, 1] = vec[1] * inv
+    return dirs
+
+
+@njit
+def local_normal(xy, i, nv):
+    if i == 0:
+        tx, ty = xy[1] - xy[0]
+    elif i == nv - 1:
+        tx, ty = xy[nv - 1] - xy[nv - 2]
+    else:
+        tx, ty = xy[i + 1] - xy[i - 1]
+    nx, ny = -ty, tx
+    inv = 1.0 / (np.sqrt(nx * nx + ny * ny) + 1e-16)
+    return np.array((nx * inv, ny * inv))
+
 
 @njit
 def getInformedForce(q, ants, angles, f0, nv):
     dirs = getAntDirections(q, ants, angles, nv)
-    F = np.zeros((nv, 2))
+    F = np.zeros((nv, 2), dtype=q.dtype)
     for i in range(nv):
         for j in range(2):
-            if ants[i,j] == 1:
-                F[i] += f0 * dirs[i,j]
+            if ants[i, j] == 1:
+                F[i] += f0 * dirs[i, j]
     return F
+
 
 @njit
 def getPullerForce(q, ants, angles, f0, nv):
     dirs = getAntDirections(q, ants, angles, nv)
-    F = np.zeros((nv, 2))
+    F = np.zeros((nv, 2), dtype=q.dtype)
     for i in range(nv):
         for j in range(2):
-            if ants[i,j] == 2:
-                F[i] += f0 * dirs[i,j]
+            if ants[i, j] == 2:
+                F[i] += f0 * dirs[i, j]
     return F
 
-# ----------------------------------------------------------------------
+
 @njit
-def pConvert(q, F, ants, angles, f_ind, Kconvert, nv):
-    p = getAntDirections(q, ants, angles, nv)
+def pConvert(q, F, ants, angles, f_ind, nv):
+    dirs = getAntDirections(q, ants, angles, nv)
     Pr = np.zeros((nv, 2))
+
     for i in range(nv):
         Fi = F[i]
         for j in range(2):
-            aij = ants[i,j]
+            aij = ants[i, j]
             if aij < 2:
                 continue
-            arg = (p[i,j,0]*Fi[0] + p[i,j,1]*Fi[1]) / f_ind
-            if aij == 2:
-                Pr[i,j] = np.exp(-arg)
-            elif aij == 3:
-                Pr[i,j] = np.exp(arg)
-    return Kconvert * Pr
+            arg = (dirs[i, j, 0] * Fi[0] + dirs[i, j, 1] * Fi[1]) / f_ind
+            p_pull = safe_sigmoid(arg)
+            p_lift = 1.0 - p_pull
+            Pr[i, j] = p_lift if aij == 2 else p_pull
+    return Pr
 
-# ----------------------------------------------------------------------
+
 @njit
 def attachAnt(ants, angles, nv, phiMax=np.deg2rad(52.0)):
-    a = ants.flatten()
-    an = angles.flatten()
-    free_sites = np.where(a == 0)[0]
-    if free_sites.size == 0:
+    free = np.argwhere(ants == 0)[2:] # Ignore origin node
+    if free.shape[0] == 0:
         return ants, angles
-    site = np.random.choice(free_sites)
-    a[site] = 1
-    an[site] = 0.0
-    return a.reshape(nv,2), an.reshape(nv,2)
+    i, j = free[np.random.randint(free.shape[0])]
+    ants[i, j] = 1
+    angles[i, j] = np.random.uniform(-phiMax, phiMax)
+    return ants, angles
 
-# ----------------------------------------------------------------------
+
 @njit
 def detachAnt(ants, angles, nv):
     a = ants.flatten()
     an = angles.flatten()
-    occ = np.where(a > 0)[0]
+    occ = np.where((a == 2) | (a == 3))[0]
     if occ.size == 0:
         return ants, angles
-    site = np.random.choice(occ)
+    site = occ[np.random.randint(occ.size)]
     a[site] = 0
     an[site] = 0.0
-    return a.reshape(nv,2), an.reshape(nv,2)
+    return a.reshape(nv, 2), an.reshape(nv, 2)
 
-# ----------------------------------------------------------------------
+
 @njit
-def forgetAnt(ants, angles, nv):
+def forgetAnt(q, F, ants, angles, f_ind, nv,
+              nestDir=np.array([1.0, 0.0]),
+              phiDamping=0.95, phiMax_deg=52.0):
     a = ants.flatten()
     an = angles.flatten()
-    inf_idx = np.where(a == 1)[0]
-    if inf_idx.size == 0:
+    inf = np.where(a == 1)[0]
+    if inf.size == 0:
         return ants, angles
-    site = np.random.choice(inf_idx)
-    if np.random.rand() < 0.5: #TODO: check this
+    site = inf[np.random.randint(inf.size)]
+
+    dirs = getAntDirections(q, ants, angles, nv)
+    i_vertex = site // 2
+    j_side = site % 2
+    pij = dirs[i_vertex, j_side]
+    Fi = F[i_vertex]
+    arg = (pij[0] * Fi[0] + pij[1] * Fi[1]) / f_ind
+
+    p_pull = safe_sigmoid(-arg)
+    if np.random.rand() < p_pull:
         a[site] = 2
+        ants_tmp = a.reshape(nv, 2)
+        angles_tmp = an.reshape(nv, 2)
+        reorientAnts(ants_tmp, angles_tmp, nestDir, nv,
+                     q, F, phiDamping, phiMax_deg)
+        return ants_tmp, angles_tmp
     else:
         a[site] = 3
         an[site] = 0.0
-    return a.reshape(nv,2), an.reshape(nv,2)
+    return a.reshape(nv, 2), an.reshape(nv, 2)
 
-# ----------------------------------------------------------------------
+
 @njit
-def reorientAnts(ants, angles, nestDir, nv, q, F, phiMax=52, damping=0.95):
-    phiMax = np.deg2rad(phiMax) # Convert to radians
+def signed_angle(v1, v2):
+    cross = v1[0] * v2[1] - v1[1] * v2[0]
+    dot = v1[0] * v2[0] + v1[1] * v2[1]
+    return np.arctan2(cross, dot)
+
+
+@njit
+def reorientAnts(ants, angles, nestDir, nv, q, F,
+                 phiDamping=0.95, phiMax_deg=52.0):
+    phiMax = np.deg2rad(phiMax_deg)
+    nestDir = nestDir / np.linalg.norm(nestDir)
     antDirs = getAntDirections(q, ants, angles, nv)
+
     for i in range(nv):
         for j in range(2):
-            if ants[i, j] == 1:
-                refDir = nestDir - antDirs[i, j] # Shift to reference frame
-            elif ants[i, j] == 2:
-                refDir = F[i]
-            else:
+            state = ants[i, j]
+            if state == 0 or state == 3:
                 continue
-            phi0 = angles[i, j]  # Current angle
-            theta = np.arctan2(refDir[1], refDir[0])  # Desired angle
-            phi = phi0 + (theta - phi0)*(1-damping)  # Damped (weighted) angle
 
-            if np.abs(phi) > phiMax:
-                phi = np.sign(phi) * phiMax
-            angles[i, j] = phi  # Update angle
-    return
+            base = antDirs[i, j]
+            if state == 1:
+                desired = nestDir
+            else:
+                Fi = F[i]
+                Fi_ = Fi - (Fi @ base) * base
+                if np.linalg.norm(Fi_) < 1e-12:
+                    continue
+                desired = Fi_ / np.linalg.norm(Fi_)
 
-# ----------------------------------------------------------------------
+            phi_des = signed_angle(base, desired)
+            phi_new = phiDamping * angles[i, j] + (1.0 - phiDamping) * phi_des
+
+            # wrap & clamp
+            if phi_new > np.pi:
+                phi_new -= 2 * np.pi
+            elif phi_new < -np.pi:
+                phi_new += 2 * np.pi
+            if phi_new > phiMax:
+                phi_new = phiMax
+            elif phi_new < -phiMax:
+                phi_new = -phiMax
+            angles[i, j] = phi_new
+
+
 @njit
-def convertAnt(q, F, ants, angles, f_ind, Kconvert, nv):
-    P = pConvert(q, F, ants, angles, f_ind, Kconvert, nv).flatten()
-    # TODO: Convert the ant with the highest probability?
+def convertAnt(q, F, ants, angles, f_ind, nv):
+    P = pConvert(q, F, ants, angles, f_ind, nv).flatten()
     a = ants.flatten()
     an = angles.flatten()
+
     idx = np.where(a >= 2)[0]
-    site = np.random.choice(idx)
+    if idx.size == 0:
+        return ants, angles
+    site = idx[np.random.randint(idx.size)]
     if np.random.rand() < P[site]:
-        if a[site] == 2:
-            a[site] = 3 # lifter
+        if a[site] == 2:  # puller to lifter
+            a[site] = 3
             an[site] = 0.0
-        else:
-            a[site] = 2 # puller
-    return a.reshape(nv,2), an.reshape(nv,2)
+        else:  # lifter to puller
+            a[site] = 2
+            iv, js = divmod(site, 2)
+            F_loc = F[iv]
+            if np.linalg.norm(F_loc) > 1e-12:
+                ants_tmp = a.reshape(nv, 2)
+                angles_tmp = an.reshape(nv, 2)
+                dirs = getAntDirections(q, ants_tmp, angles_tmp, nv)
+                base = dirs[iv, js]
+                angles_tmp[iv, js] = signed_angle(base,
+                                                  F_loc / np.linalg.norm(F_loc))
+                return ants_tmp, angles_tmp
+    return a.reshape(nv, 2), an.reshape(nv, 2)
+
 
 ##############################################################################
-#                          ROD MECHANICS
+#                              ROD MECHANICS
 ##############################################################################
 @njit
 def createRod(nv, length):
     nodes = np.zeros((nv, 2))
     xs = np.linspace(0.0, length, nv)
     for i in range(nv):
-        nodes[i,0] = xs[i]
-        nodes[i,1] = 0.0
-    dL = (length/(nv-1)) * np.ones(nv-1)
+        nodes[i, 0] = xs[i]
+        nodes[i, 1] = 0.0
+    dL = (length / (nv - 1)) * np.ones(nv - 1)
     return nodes, dL
+
 
 @njit
 def getStateVectors(nodes):
     nv = nodes.shape[0]
-    q = np.zeros(2*nv)
+    q = np.zeros(2 * nv)
     for i in range(nv):
-        q[2*i  ] = nodes[i,0]
-        q[2*i+1] = nodes[i,1]
+        q[2 * i] = nodes[i, 0]
+        q[2 * i + 1] = nodes[i, 1]
     return q
 
-@njit
+
+@njit(fastmath=True)
 def getFs(q, dL, nv, EA):
     """
     Stretching force
     """
     Fs = np.zeros_like(q)
-    for k in range(nv-1):
+    for k in range(nv - 1):
         L0 = dL[k]
-        x0, y0 = q[2*k],   q[2*k+1]
-        x1, y1 = q[2*(k+1)], q[2*(k+1)+1]
+        x0, y0 = q[2 * k], q[2 * k + 1]
+        x1, y1 = q[2 * (k + 1)], q[2 * (k + 1) + 1]
         dx = x1 - x0
         dy = y1 - y0
-        L = np.sqrt(dx*dx + dy*dy) + 1e-16
+        L = np.sqrt(dx * dx + dy * dy) + 1e-16
 
-        fac = (EA/L0)*(1.0 - L/L0)
-        fx = fac*(dx/L)
-        fy = fac*(dy/L)
-        Fs[2*k  ]   -= fx
-        Fs[2*k+1]   -= fy
-        Fs[2*(k+1)] += fx
-        Fs[2*(k+1)+1] += fy
+        fac = (EA / L0) * (1.0 - L / L0)
+        fx = fac * (dx / L)
+        fy = fac * (dy / L)
+        Fs[2 * k] -= fx
+        Fs[2 * k + 1] -= fy
+        Fs[2 * (k + 1)] += fx
+        Fs[2 * (k + 1) + 1] += fy
     return Fs
 
-@njit
+
+@njit(fastmath=True)
 def getFb(q, dL, nv, EI):
     """
     Bending force
     """
     Fb = np.zeros_like(q)
-    for k in range(nv-2):
-        x0, y0 = q[2*k],   q[2*k+1]
-        x1, y1 = q[2*(k+1)], q[2*(k+1)+1]
-        x2, y2 = q[2*(k+2)], q[2*(k+2)+1]
+    for k in range(nv - 2):
+        x0, y0 = q[2 * k], q[2 * k + 1]
+        x1, y1 = q[2 * (k + 1)], q[2 * (k + 1) + 1]
+        x2, y2 = q[2 * (k + 2)], q[2 * (k + 2) + 1]
         L0 = dL[k]
 
         p0 = np.array([x0, y0, 0.0])
         p1 = np.array([x1, y1, 0.0])
         p2 = np.array([x2, y2, 0.0])
-        e  = p1 - p0
-        f  = p2 - p1
+        e = p1 - p0
+        f = p2 - p1
         norm_e = np.sqrt(e.dot(e)) + 1e-16
         norm_f = np.sqrt(f.dot(f)) + 1e-16
         te = e / norm_e
         tf = f / norm_f
-        dot_val   = te.dot(tf)
+        dot_val = te.dot(tf)
         cross_val = np.cross(te, tf)
         kappa = 2.0 * cross_val[2] / (1.0 + dot_val + 1e-16)
 
         cross_tf_te = np.cross(tf, te)
         cross_te_tf = -cross_tf_te
         denom = (1.0 + dot_val + 1e-16)
-        DkappaDe = (1.0/norm_e)*(-kappa*te + cross_tf_te/denom)
-        DkappaDf = (1.0/norm_f)*(-kappa*te + cross_te_tf/denom)
+        DkappaDe = (1.0 / norm_e) * (-kappa * te + cross_tf_te / denom)
+        DkappaDf = (1.0 / norm_f) * (-kappa * te + cross_te_tf / denom)
 
         gradKappa = np.zeros(6)
         gradKappa[0:2] = -DkappaDe[0:2]
         gradKappa[2:4] = DkappaDe[0:2] - DkappaDf[0:2]
         gradKappa[4:6] = DkappaDf[0:2]
 
-        tmp = EI*kappa/(L0*L0) * gradKappa
-        Fb[2*k   ] -= tmp[0]
-        Fb[2*k+1 ] -= tmp[1]
-        Fb[2*(k+1)   ] -= tmp[2]
-        Fb[2*(k+1)+1 ] -= tmp[3]
-        Fb[2*(k+2)   ] -= tmp[4]
-        Fb[2*(k+2)+1 ] -= tmp[5]
+        tmp = EI * kappa / (L0 * L0) * gradKappa
+        Fb[2 * k] -= tmp[0]
+        Fb[2 * k + 1] -= tmp[1]
+        Fb[2 * (k + 1)] -= tmp[2]
+        Fb[2 * (k + 1) + 1] -= tmp[3]
+        Fb[2 * (k + 2)] -= tmp[4]
+        Fb[2 * (k + 2) + 1] -= tmp[5]
     return Fb
 
-##############################################################################
-#             SINGLE STEP FOR ROD + GILLESPIE EVENT
-##############################################################################
-@njit
-def solveStep(q, F, dL, nv, dt, gamma, EI, EA,
-              antsObj,
-              cTime, eventTime):
-    
-    # TODO: We can call either call mechanical forces here (or pass them as arguments)
-    #       to allow ants to reorient\convert based on the mechanical forces alone- sensing velocity.
-    #
-    #       Also, we can return the four forces acting on the rod (bending, stretching, informed, puller)
-    #       individually to allow for more detailed analysis.
-
-    if cTime >= eventTime:
-        Ron     = antsObj.getRon()
-        Roff    = antsObj.getRoff()
-        Rforget = antsObj.getRforget()
-        Rreorient = antsObj.getRreorient()
-        Rconvert  = antsObj.getRconvert(q, F)
-        Rtot = Ron + Roff + Rforget + Rreorient + Rconvert
-
-        if Rtot > 1e-16: # TODO: why? zero division? shouldn't happen because Kon + Koff + Kforget > 0
-            r1 = np.random.rand()
-            tau = -np.log(r1)/Rtot # Exponential distributed; lambda = Rtot
-            eventTime = cTime + tau
-
-            r2 = np.random.rand()
-            # TODO: This is correct but can be rewritten in a more readable way (see original implementation)
-            if r2 < Ron / Rtot:
-                antsObj.attachAnt()
-            elif Ron / Rtot <= r2 < (Ron + Roff) / Rtot:
-                antsObj.detachAnt()
-            elif (Ron + Roff) / Rtot <= r2 < (Ron + Roff + Rconvert) / Rtot:
-                antsObj.convertAnt(q, F)
-            elif (Ron + Roff + Rconvert) / Rtot <= r2 < (Ron + Roff + Rconvert + Rreorient) / Rtot:
-                antsObj.reorientAnts(q, F)
-            elif Rforget != 0:
-                antsObj.forgetAnt()
-
-
-    Fb_ = getFb(q, dL, nv, EI)
-    Fs_ = getFs(q, dL, nv, EA)
-    Finf = antsObj.getInformedForce(q).flatten()
-    Fpull= antsObj.getPullerForce(q).flatten()
-
-    Ftot = Fb_ + Fs_ + Finf + Fpull
-    qDot = Ftot / gamma
-    qNew = q + qDot*dt
-    qNew[0] = q[0]
-    qNew[1] = q[1]
-    return qNew, Ftot.reshape(-1,2), eventTime
-
-
-##############################################################################
-#                      PLOT UTILITIES
-##############################################################################
 from antMarker import getMarker
-
 def plotrod(q, cTime, length):
     plt.clf()
-    nv = len(q)//2
+    nv = len(q) // 2
     x = q[0::2]
     y = q[1::2]
-    plt.plot(x[0], y[0], 'o', markersize=10, color='gray')
+    plt.plot(x[0], y[0], 'o', markersize=10, color='tab:red')
     plt.plot(x, y, '-', linewidth=2, color='black', zorder=1)
-    plt.xlim([-1.2*length, 1.2*length])
-    plt.ylim([-1.2*length, 1.2*length])
+    plt.xlim([-1.2 * length, 1.2 * length])
+    plt.ylim([-1.2 * length, 1.2 * length])
     plt.title(f"t={cTime:.2f}")
 
+
 def plotAnts(q, AntsObj):
-    nv = len(q)//2
+    nv = len(q) // 2
     xy = q.reshape(nv, 2)
     dirs = getAntDirections(q, AntsObj.ants, AntsObj.angles, nv)
-    colordict = {0:'none', 1:'#fc0084', 2:'#01d5df', 3:'#957cfe'}
-    for i in range(1, nv):
+    colordict = {0: 'none', 1: '#648FFF', 2: '#DC267F', 3: '#FE6100'}
+    for i in range(nv):
         for j in range(2):
-            aij = AntsObj.ants[i,j]
+            aij = AntsObj.ants[i, j]
             if aij == 0:
                 continue
             sx, sy = xy[i, 0], xy[i, 1]
-            ex = sx + 0.9 * dirs[i, j, 0]
-            ey = sy + 0.9 * dirs[i, j, 1]
-            px = np.mean([sx, ex])
-            py = np.mean([sy, ey])
-            angij = np.arctan2(dirs[i, j, 1], dirs[i, j, 0]) - np.pi/2
-            plt.plot([px], [py],
+            ex = sx + 0.5 * dirs[i, j, 0]
+            ey = sy + 0.5 * dirs[i, j, 1]
+            angij = np.arctan2((ey - sy), (ex - sx)) - np.pi/2
+            plt.plot([sx, ex], [sy, ey],
                      color=colordict[aij],
                      linewidth=0,
                      marker=getMarker(angij),
@@ -453,93 +495,184 @@ def plotAnts(q, AntsObj):
                           linestyle='None', label=kind) for i, kind in enumerate(['Informed', 'Puller', 'Lifter'])]
             plt.legend(handles=lgnd, loc='upper left', frameon=False, ncols=len(lgnd))
 
-##############################################################################
-#                       MAIN RUN FUNCTION
-##############################################################################
-def run(totalTime, doPlot=False, saveData=True):
-    L = 15.0
-    NV = int(L) + 1
-    EI = 1e4
-    EA = 1e4
-    gamma = 2.5
-    dt = 1e-4
 
-    nodes, dL = createRod(NV, L)
-    q0 = getStateVectors(nodes)
+# ----------------------------------------------------------------------
+@njit
+def solveStep(q, dL, nv, dt, gamma, EI, EA,
+              antsObj, cTime, eventTime):
+    # deterministic forces
+    Fb = getFb(q, dL, nv, EI)
+    Fs = getFs(q, dL, nv, EA)
+    Finf = antsObj.getInformedForce(q).flatten()
+    Fpull = antsObj.getPullerForce(q).flatten()
+    Fcurr = Fb + Fs + Finf + Fpull
+
+    # Gillespie events
+    if cTime >= eventTime:
+        Ron = antsObj.getRon()
+        Roff = antsObj.getRoff()
+        Rconvert = antsObj.getRconvert(q, Fcurr.reshape(nv, 2))
+        Rreorient = antsObj.getRreorient()
+        Rforget = antsObj.getRforget()
+        Rtot = Ron + Roff + Rforget + Rreorient + Rconvert
+
+        if Rtot > 1e-16:
+            tau = -np.log(np.random.rand()) / Rtot
+            eventTime = cTime + tau
+            r2 = np.random.rand()
+
+            if r2 < Ron / Rtot:
+                antsObj.attachAnt()
+            elif r2 < (Ron + Roff) / Rtot:
+                antsObj.detachAnt()
+            elif r2 < (Ron + Roff + Rconvert) / Rtot:
+                antsObj.convertAnt(q, Fcurr.reshape(nv, 2))
+            elif r2 < (Ron + Roff + Rconvert + Rreorient) / Rtot:
+                antsObj.reorientAnts(q, Fcurr.reshape(nv, 2))
+            else:
+                antsObj.forgetAnt(q, Fcurr.reshape(nv, 2))
+
+            Finf = antsObj.getInformedForce(q).flatten()
+            Fpull = antsObj.getPullerForce(q).flatten()
+            Fcurr = Fb + Fs + Finf + Fpull
+
+    # semi-implicit integration
+    qDot = Fcurr / gamma
+    qMid = q + 0.5 * dt * qDot
+
+    Fb_m = getFb(qMid, dL, nv, EI)
+    Fs_m = getFs(qMid, dL, nv, EA)
+    Finf_m = antsObj.getInformedForce(qMid).flatten()
+    Fpull_m = antsObj.getPullerForce(qMid).flatten()
+    Fmid = Fb_m + Fs_m + Finf_m + Fpull_m
+
+    qDot += (Fmid - Fcurr) / (2 * gamma)
+    qNew = q + dt * qDot
+    qNew[0:2] = q[0:2]  # hinge pinned
+
+    return qNew, Fmid.reshape(nv, 2), eventTime
+
+
+##############################################################################
+def run(totalTime: float,
+        L: float,
+        params: dict,
+        seg_len: float = SEG_LEN_CM,
+        saveData: bool = False,
+        output: str = None):
+    nv = int(np.ceil(L / seg_len)) + 1
+    L_sim = seg_len * (nv - 1)
+
+    scale = seg_len / BASE_SEG_LEN_CM
+    EA = EA_BASE * scale
+    EI = EI_BASE * scale ** 2
+    gamma = GAMMA_BASE * scale
 
     F0 = 2.8
-    F_IND = 10.0
-    nestDir = np.array([1.0, 0.0])
-    Kon = 0.0215
-    Koff = 0.015
-    Kforget = 0.09
-    Kconvert = 0.2
-    Kreorient = 0.7
+    Ants_per_cm = 5.0
+    F0_cluster = F0 * Ants_per_cm * seg_len
 
-    saveEvery = int(1/dt) / 10
-    plotEvery = int(1/dt) * 2
+    F_IND = 4
 
-    antsObj = Ants(NV=NV, F0=F0, F_IND=F_IND, NEST_DIR=nestDir,
-                   Kon=Kon, Koff=Koff, Kforget=Kforget,
-                   Kconvert=Kconvert, Kreorient=Kreorient)
+    Kon = params.get('Kon')
+    Koff = params.get('Koff')
+    Kforget = params.get('Kforget')
+    Kconvert = params.get('Kconvert')
+    Kreorient = params.get('Kreorient')
 
-    # Time stepping
-    cTime = 0.0
-    eventTime = 0.0
-    q = q0.copy()
-    F = np.zeros((NV, 2))
-
-    time_list = []
-    q_list = []
-    ants_list = []
-    angles_list = []
-
-    stepCount = 0
-
-    if doPlot:
-        plt.figure(figsize=(6, 6))
-
-    # Create progress bar
-    pbar = tqdm(total=totalTime, desc="Running simulation", unit="Time")
-
-    while cTime < totalTime:
-        if stepCount % saveEvery == 0:
-            time_list.append(cTime)
-            q_list.append(q.copy())
-            ants_list.append(antsObj.ants.copy())
-            angles_list.append(antsObj.angles.copy())
-
-        q, F, eventTime = solveStep(q, F, dL, NV, dt, gamma, EI, EA,
-                                    antsObj,
-                                    cTime, eventTime)
-        cTime += dt
-        stepCount += 1
-
-        pbar.update(cTime)
-
-        if doPlot and (stepCount % plotEvery == 0):
-            plotrod(q, cTime, L)
-            plotAnts(q, antsObj)
-            plt.pause(0.01)
-
-    # Save final state
-    time_list.append(cTime)
-    q_list.append(q.copy())
-    ants_list.append(antsObj.ants.copy())
-    angles_list.append(antsObj.angles.copy())
+    phiDamping, phiMax = 0.95, 52.0
+    dt = 2e-4
+    saveEvery = 200
 
     if saveData:
-        time_array = np.array(time_list)
-        q_array = np.array(q_list)
-        ants_array = np.array(ants_list)
-        angles_array = np.array(angles_list)
+        print(f"Saving snapshots every {saveEvery} steps (≈{saveEvery * dt:g}s)")
 
-        np.savez("soft_pendulum_microscopic.npz", # TODO: Filename based on parameters
-                 time=time_array,
-                 q=q_array,
-                 ants=ants_array,
-                 angles=angles_array)
-        print("Data saved!")
+    nodes, dL = createRod(nv, L_sim)
+    q0 = getStateVectors(nodes)
+
+    antsObj = Ants(NV=nv, F0=F0_cluster, F_IND=F_IND,
+                   NEST_DIR=np.array([1.0, 0.0]),
+                   Kon=Kon, Koff=Koff, Kforget=Kforget,
+                   Kconvert=Kconvert, Kreorient=Kreorient,
+                   phiDamping=phiDamping, phiMax=phiMax)
+
+    cTime, eventTime = 0.0, 0.0
+    q = q0.copy()
+
+    time_hist, q_hist, ants_hist, angles_hist = [], [], [], []
+    step = 0
+    pbar = tqdm(total=int(totalTime / dt), desc="Simulating", unit="steps")
+
+    time_hist.append(cTime)
+    q_hist.append(q.copy())
+    ants_hist.append(antsObj.ants.copy())
+    angles_hist.append(antsObj.angles.copy())
+
+    while cTime < totalTime:
+        if step % saveEvery == 0:
+            time_hist.append(cTime)
+            q_hist.append(q.copy())
+            ants_hist.append(antsObj.ants.copy())
+            angles_hist.append(antsObj.angles.copy())
+        try:
+            q, F, eventTime = solveStep(q, dL, nv, dt, gamma, EI, EA,
+                                    antsObj, cTime, eventTime)
+        except Exception as e:
+            print(f"Error at step {step}: {e}")
+            print("Saving data before exiting...")
+            break
+        cTime += dt
+        step += 1
+        pbar.update(1)
+
+    if saveData:
+        dirname = datetime.datetime.now().strftime("sim_%Y%m%d")
+        os.makedirs(dirname, exist_ok=True)
+        if output is not None:
+            fname = os.path.join(dirname, output)
+        else:
+            fname = os.path.join(dirname,
+                             f"rod_L{L_sim:.1f}cm_seg{seg_len:.2f}cm.npz")
+        np.savez(fname,
+                 time=np.array(time_hist),
+                 q=np.array(q_hist),
+                 ants=np.array(ants_hist),
+                 angles=np.array(angles_hist),
+                 params=json.dumps({
+                     "L_cm": L_sim,
+                     "seg_len_cm": seg_len,
+                     "nv": nv,
+                     "EA": EA,
+                     "EI": EI,
+                     "gamma": gamma,
+                     "F0": F0,
+                     "F_IND": F_IND,
+                     "Kon": Kon,
+                     "Koff": Koff,
+                     "Kforget": Kforget,
+                     "Kconvert": Kconvert,
+                     "Kreorient": Kreorient,
+                     "dt": dt
+                 }))
+        print(f'Data saved → {fname}')
+    pbar.close()
+
 
 if __name__ == "__main__":
-    run(totalTime=400, doPlot=True)
+    t0 = time()
+    Lrange = [5.0, 10.0, 15.0]
+    for itr in range(100):
+        Kon, Koff, Kforget, Kconvert, Kreorient = np.random.uniform(0.02, 1.0, 5)
+        params = {
+            'Kon': Kon,
+            'Koff': Koff,
+            'Kforget': Kforget,
+            'Kconvert': Kconvert,
+            'Kreorient': Kreorient
+        }
+        for L_idx in prange(3):
+            L = Lrange[L_idx]
+            run(totalTime=2000.0, L=L, params=params,
+                seg_len=0.5, saveData=True,
+                output=f"rod_L{L:.1f}cm_seg0.5cm_paramItr{itr:03d}.npz")
+    print(f'Finished in {time() - t0:.1f}s')
