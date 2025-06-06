@@ -9,13 +9,16 @@ import multiprocessing as mp
 def animate_from_npz_funcAnimation(npz_file="soft_pendulum_microscopic.npz",
                                    out_file="rod_ants",
                                    rod_length=5.0,
+                                   skipEvery=200,
                                    output_format="gif"):
 
+    out_file += f"_{rod_length}cm"
+
     data = np.load(npz_file, allow_pickle=True)
-    time_array   = data["time"]
-    q_array      = data["q"]
-    ants_array   = data["ants"]
-    angles_array = data["angles"]
+    time_array   = data["time"][::skipEvery]
+    q_array      = data["q"][::skipEvery]
+    ants_array   = data["ants"][::skipEvery]
+    angles_array = data["angles"][::skipEvery]
 
     fig, ax = plt.subplots(figsize=(6,6))
 
@@ -78,9 +81,10 @@ def animate_from_npz_funcAnimation(npz_file="soft_pendulum_microscopic.npz",
 
 
 def run_animation():
-        animate_from_npz_funcAnimation(npz_file="soft_pendulum_microscopic.npz",
-                                       out_file="rod_ants",
-                                       rod_length=15.0,
+        animate_from_npz_funcAnimation(npz_file=r"sim_20250518\rod_L5.0cm_seg0.5cm_paramItr000.npz",
+                                       out_file="rod_ants1",
+                                       rod_length=5,
+                                        skipEvery=20,
                                        output_format="mp4")
         
 if __name__ == "__main__":
