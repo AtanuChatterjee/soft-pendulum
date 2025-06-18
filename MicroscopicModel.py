@@ -19,8 +19,8 @@ sns.set_theme(context='paper', style='ticks', font_scale=1.2)
 SEG_LEN_CM = 1.0
 BASE_SEG_LEN_CM = 1.0
 
-EA_BASE = 1e4
-EI_BASE = 1e4
+EA_BASE = 1e5
+EI_BASE = 1e5
 GAMMA_BASE = 10
 
 
@@ -546,8 +546,13 @@ def solveStep(q, dL, nv, dt, gamma, EI, EA,
     Fpull_m = antsObj.getPullerForce(qMid).flatten()
     Fmid = Fb_m + Fs_m + Finf_m + Fpull_m
 
-    qDot += (Fmid - Fcurr) / (2 * gamma)
+    # qDot += (Fmid - Fcurr) / (2 * gamma)
+    qDot = Fmid / gamma
+    # Clip qDot to avoid excessive velocities
+    # qDot = np.clip(qDot, -1e3, 1e3)
+    
     qNew = q + dt * qDot
+
     qNew[0:2] = q[0:2]  # hinge pinned
 
     return qNew, Fmid.reshape(nv, 2), eventTime
@@ -559,6 +564,9 @@ def run(totalTime: float,
         params: dict,
         seg_len: float = SEG_LEN_CM,
         saveData: bool = False,
+        plotRod: bool = False,
+        saveEvery: int = 200,
+        dt: float = 1e-4,
         output: str = None):
     nv = int(np.ceil(L / seg_len)) + 1
     L_sim = seg_len * (nv - 1)
@@ -569,7 +577,7 @@ def run(totalTime: float,
     gamma = GAMMA_BASE * scale
 
     F0 = 2.8
-    Ants_per_cm = 5.0
+    Ants_per_cm = 2.5
     F0_cluster = F0 * Ants_per_cm * seg_len
 
     F_IND = 4
@@ -581,11 +589,11 @@ def run(totalTime: float,
     Kreorient = params.get('Kreorient')
 
     phiDamping, phiMax = 0.95, 52.0
-    dt = 2e-4
-    saveEvery = 200
 
     if saveData:
         print(f"Saving snapshots every {saveEvery} steps (≈{saveEvery * dt:g}s)")
+    if plotRod:
+        print(f"Plotting rod every {saveEvery} steps (≈{saveEvery * dt:g}s)")
 
     nodes, dL = createRod(nv, L_sim)
     q0 = getStateVectors(nodes)
@@ -614,6 +622,10 @@ def run(totalTime: float,
             q_hist.append(q.copy())
             ants_hist.append(antsObj.ants.copy())
             angles_hist.append(antsObj.angles.copy())
+            if plotRod:
+                plotrod(q, cTime, L_sim)
+                plotAnts(q, antsObj)
+                plt.pause(0.01)
         try:
             q, F, eventTime = solveStep(q, dL, nv, dt, gamma, EI, EA,
                                     antsObj, cTime, eventTime)
@@ -660,19 +672,21 @@ def run(totalTime: float,
 
 if __name__ == "__main__":
     t0 = time()
-    Lrange = [5.0, 10.0, 15.0]
-    for itr in range(100):
-        Kon, Koff, Kforget, Kconvert, Kreorient = np.random.uniform(0.02, 1.0, 5)
-        params = {
-            'Kon': Kon,
-            'Koff': Koff,
-            'Kforget': Kforget,
-            'Kconvert': Kconvert,
-            'Kreorient': Kreorient
-        }
-        for L_idx in prange(3):
-            L = Lrange[L_idx]
-            run(totalTime=2000.0, L=L, params=params,
-                seg_len=0.5, saveData=True,
-                output=f"rod_L{L:.1f}cm_seg0.5cm_paramItr{itr:03d}.npz")
+    Lrange = [5.0, 10.0, 20.0, 30.0]  # Lengths in cm
+
+    Kon, Koff, Kforget, Kconvert, Kreorient = 0.2, 0.02, 0.02, 0.05, 0.05
+    params = { 
+        'Kon': Kon,
+        'Koff': Koff,
+        'Kforget': Kforget,
+        'Kconvert': Kconvert,
+        'Kreorient': Kreorient
+    }
+    for L_idx in prange(len(Lrange)):
+        L = Lrange[L_idx]
+        print(f'Simulating rod of length {L:.1f} cm...')
+        run(totalTime=1000.0, L=L, params=params,
+            seg_len=0.5, saveData=True, plotRod=False,
+            saveEvery=int(5e3), dt=1e-5,
+            output=f"rod_L{L:.1f}cm_seg0.5cm.npz")
     print(f'Finished in {time() - t0:.1f}s')
