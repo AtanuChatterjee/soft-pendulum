@@ -12,8 +12,6 @@ def animate_from_npz_funcAnimation(npz_file="soft_pendulum_microscopic.npz",
                                    skipEvery=200,
                                    output_format="gif"):
 
-    out_file += f"_{rod_length}cm"
-
     data = np.load(npz_file, allow_pickle=True)
     time_array   = data["time"][::skipEvery]
     q_array      = data["q"][::skipEvery]
@@ -44,6 +42,8 @@ def animate_from_npz_funcAnimation(npz_file="soft_pendulum_microscopic.npz",
         ax.set_aspect('equal', 'box')
         ax.set_xlim([-1.2*rod_length, 1.2*rod_length])
         ax.set_ylim([-1.2*rod_length, 1.2*rod_length])
+        ax.set_title(f"L = {rod_length} cm, Time: {t:.2f} s")
+        
 
         pbar.update(1)
 
@@ -79,12 +79,20 @@ def animate_from_npz_funcAnimation(npz_file="soft_pendulum_microscopic.npz",
     pbar.close()
     print(f"Animation saved as {outfile}")
 
-
-def run_animation():
-        animate_from_npz_funcAnimation(npz_file=r"sim_20250518\rod_L5.0cm_seg0.5cm_paramItr000.npz",
-                                       out_file="rod_ants1",
-                                       rod_length=5,
-                                        skipEvery=20,
+relpath=r'sim_20250618\rod_L20.0cm_seg0.5cm.npz'
+def run_animation(relpath=relpath):
+        tokens = relpath.split("_")
+        for token in tokens:
+            if "L" in token:
+                L = float(token.split("L")[1].split("cm")[0])
+                print(f"Rod length found: {L} cm")
+        
+        outfile = relpath.rstrip(".npz")
+        outfile += "_animation"
+        animate_from_npz_funcAnimation(npz_file=relpath,
+                                       out_file=outfile,
+                                       rod_length=L,
+                                       skipEvery=10,
                                        output_format="mp4")
         
 if __name__ == "__main__":
